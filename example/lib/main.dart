@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:mobile_scanner_example/barcode_scanner_controller.dart';
 import 'package:mobile_scanner_example/barcode_scanner_returning_image.dart';
+import 'package:mobile_scanner_example/barcode_scanner_window.dart';
 import 'package:mobile_scanner_example/barcode_scanner_without_controller.dart';
 
 void main() => runApp(const MaterialApp(home: MyHome()));
@@ -27,6 +28,16 @@ class MyHome extends StatelessWidget {
                 );
               },
               child: const Text('MobileScanner with Controller'),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (context) => const BarcodeScannerWithScanWindow(),
+                  ),
+                );
+              },
+              child: const Text('MobileScanner with ScanWindow'),
             ),
             ElevatedButton(
               onPressed: () {

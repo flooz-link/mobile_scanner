@@ -4,9 +4,13 @@ import android.Manifest
 import android.app.Activity
 import android.content.pm.PackageManager
 import android.graphics.Point
+import android.graphics.Rect
+import android.graphics.RectF
 import android.net.Uri
 import android.util.Log
 import android.util.Size
+import android.util.Rational
+import android.media.Image
 import android.view.Surface
 import androidx.annotation.NonNull
 import androidx.camera.core.*
@@ -18,12 +22,14 @@ import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.common.InputImage.IMAGE_FORMAT_NV21
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.PluginRegistry
 import io.flutter.view.TextureRegistry
 import java.io.File
+import kotlin.math.roundToInt
 
 
 class MobileScanner(private val activity: Activity, private val textureRegistry: TextureRegistry)
@@ -44,6 +50,7 @@ class MobileScanner(private val activity: Activity, private val textureRegistry:
     private var camera: Camera? = null
     private var preview: Preview? = null
     private var textureEntry: TextureRegistry.SurfaceTextureEntry? = null
+    private var scanWindow: List<Float>? = null;
 
 //    @AnalyzeMode
 //    private var analyzeMode: Int = AnalyzeMode.NONE
@@ -58,6 +65,7 @@ class MobileScanner(private val activity: Activity, private val textureRegistry:
 //            "analyze" -> switchAnalyzeMode(call, result)
             "stop" -> stop(result)
             "analyzeImage" -> analyzeImage(call, result)
+            "updateScanWindow" -> updateScanWindow(call)
             else -> result.notImplemented()
         }
     }
@@ -100,27 +108,60 @@ class MobileScanner(private val activity: Activity, private val textureRegistry:
 
     @ExperimentalGetImage
     val analyzer = ImageAnalysis.Analyzer { imageProxy -> // YUV_420_888 format
-//        when (analyzeMode) {
-//            AnalyzeMode.BARCODE -> {
-                val mediaImage = imageProxy.image ?: return@Analyzer
-                val inputImage = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
+        val mediaImage = imageProxy.image ?: return@Analyzer
+        var inputImage = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
 
-                scanner.process(inputImage)
-                        .addOnSuccessListener { barcodes ->
-                            for (barcode in barcodes) {
-                                val event = mapOf("name" to "barcode", "data" to barcode.data)
-                                sink?.success(event)
-                            }
-                        }
-                        .addOnFailureListener { e -> Log.e(TAG, e.message, e) }
-                        .addOnCompleteListener { imageProxy.close() }
-//            }
-//            else -> imageProxy.close()
-//        }
+        scanner.process(inputImage)
+            .addOnSuccessListener { barcodes ->
+                for (barcode in barcodes) {
+                    print("image: ")   
+                    println(inputImage.getWidth());
+                    println(inputImage.getHeight());
+
+                    print("barcode: ")   
+                    println(barcode.getBoundingBox());
+
+                    if(scanWindow != null) {
+                        val match = isbarCodeInScanWindow(scanWindow!!, barcode, imageProxy)
+                        if(!match) continue
+                    }
+
+                    val event = mapOf("name" to "barcode", "data" to barcode.data)
+                    sink?.success(event)
+                }
+            }
+            .addOnFailureListener { e -> Log.e(TAG, e.message, e) }
+            .addOnCompleteListener { imageProxy.close() }
+    }
+
+    private var scanner = BarcodeScanning.getClient()
+
+    private fun updateScanWindow(call: MethodCall) {
+        scanWindow = call.argument<List<Float>>("rect")
+    }
+
+    // scales the scanWindow to the provided inputImage and checks if that scaled
+    // scanWindow contains the barcode
+    private fun isbarCodeInScanWindow(scanWindow: List<Float>, barcode: Barcode, inputImage: ImageProxy): Boolean {    
+        val barcodeBoundingBox = barcode.getBoundingBox()
+        if(barcodeBoundingBox == null) return false
+
+        val imageWidth = inputImage.getHeight();
+        val imageHeight = inputImage.getWidth();
+
+        val left = (scanWindow[0] * imageWidth).roundToInt()
+        val top = (scanWindow[1] * imageHeight).roundToInt()
+        val right = (scanWindow[2] * imageWidth).roundToInt()
+        val bottom = (scanWindow[3] * imageHeight).roundToInt()
+
+        val scaledScanWindow = Rect(left, top, right, bottom)   
+
+        print("scanWindow: ")           
+        println(scaledScanWindow)           
+        return scaledScanWindow.contains(barcodeBoundingBox)
     }
 
 
-    private var scanner = BarcodeScanning.getClient()
 
     @ExperimentalGetImage
     private fun start(call: MethodCall, result: MethodChannel.Result) {
@@ -134,7 +175,7 @@ class MobileScanner(private val activity: Activity, private val textureRegistry:
             result.success(answer)
         } else {
             val facing: Int = call.argument<Int>("facing") ?: 0
-            val ratio: Int? = call.argument<Int>("ratio")
+            val ratio: Int = call.argument<Int>("ratio") ?: 1
             val torch: Boolean = call.argument<Boolean>("torch") ?: false
             val formats: List<Int>? = call.argument<List<Int>>("formats")
 
@@ -165,6 +206,10 @@ class MobileScanner(private val activity: Activity, private val textureRegistry:
                     result.error("textureEntry", "textureEntry is null", null)
                     return@addListener
                 }
+               
+                // Select the correct camera
+                val selector = if (facing == 0) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
+
                 // Preview
                 val surfaceProvider = Preview.SurfaceProvider { request ->
                     val texture = textureEntry!!.surfaceTexture()
@@ -174,29 +219,30 @@ class MobileScanner(private val activity: Activity, private val textureRegistry:
                 }
 
                 // Build the preview to be shown on the Flutter texture
-                val previewBuilder = Preview.Builder()
-                if (ratio != null) {
-                    previewBuilder.setTargetAspectRatio(ratio)
-                }
+                val previewBuilder = Preview.Builder().setTargetAspectRatio(ratio)
                 preview = previewBuilder.build().apply { setSurfaceProvider(surfaceProvider) }
+
+                // bind to lifecycle temporarily to fetch dimensions.
+                cameraProvider!!.bindToLifecycle(activity as LifecycleOwner, selector, preview)
+                val previewResolution = preview!!.resolutionInfo!!.resolution
+                val previewRotation = preview!!.getTargetRotation()
 
                 // Build the analyzer to be passed on to MLKit
                 val analysisBuilder = ImageAnalysis.Builder()
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                if (ratio != null) {
-                    analysisBuilder.setTargetAspectRatio(ratio)
-                }
+                        .setTargetAspectRatio(ratio)
+                        .setTargetRotation(previewRotation) 
                 val analysis = analysisBuilder.build().apply { setAnalyzer(executor, analyzer) }
+                
+                val viewPort = ViewPort.Builder(Rational(previewResolution.width, previewResolution.height), previewRotation).build()
+                val useCaseGroup = UseCaseGroup.Builder()
+                    .setViewPort(viewPort)
+                    .addUseCase(preview!!) 
+                    .addUseCase(analysis)
+                    .build()
 
-                // Select the correct camera
-                val selector = if (facing == 0) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
-
-                camera = cameraProvider!!.bindToLifecycle(activity as LifecycleOwner, selector, preview, analysis)
-
-                val analysisSize = analysis.resolutionInfo?.resolution ?: Size(0, 0)
-                val previewSize = preview!!.resolutionInfo?.resolution ?: Size(0, 0)
-                Log.i("LOG", "Analyzer: $analysisSize")
-                Log.i("LOG", "Preview: $previewSize")
+                cameraProvider!!.unbindAll()
+                camera = cameraProvider!!.bindToLifecycle(activity as LifecycleOwner, selector, useCaseGroup)
 
                 if (camera == null) {
                     result.error("camera", "camera is null", null)
